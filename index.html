@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>I-FailSense</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #0b0c10;
+            color: #c5c6c7;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.2em;
+            color: #66fcf1;
+        }
+
+        h2 {
+            font-size: 1.3rem;
+            margin-top: 0;
+            margin-bottom: 0.3em;
+            font-weight: 500;
+            color: #45a29e;
+        }
+
+        .authors {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 0.5em;
+            font-size: 1.1rem;
+        }
+
+        .authors span {
+            position: relative;
+        }
+
+        .footnote {
+            font-size: 0.8rem;
+            color: #f1c40f;
+            margin-top: 0.3em;
+        }
+
+        p {
+            max-width: 600px;
+            line-height: 1.5;
+        }
+
+        .links {
+            margin-top: 2em;
+            display: flex;
+            gap: 1em;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        a {
+            padding: 0.6em 1.2em;
+            background: #1f2833;
+            color: #66fcf1;
+            text-decoration: none;
+            border-radius: 6px;
+            transition: 0.2s;
+        }
+
+        a:hover {
+            background: #45a29e;
+            color: #0b0c10;
+        }
+
+        .coming-soon {
+            margin-top: 3em;
+            font-size: 1.8rem;
+            color: #f1c40f;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>I-FailSense: Towards General Robotic Failure Detection with Vision-Language Model</h1>
+    <div class="authors">
+        <span>Clémence Grislain<sup>*</sup></span>,
+        <span>Hamed Rahimi<sup>*</sup></span>,
+        <span>Olivier Sigaud</span>,
+        <span>Mohamed Chetouani</span>
+    </div>
+    <div class="footnote"><sup>*</sup> Equal contribution</div>
+    <p>
+        Language-conditioned robotic manipulation in open-world settings requires not only accurate task execution but
+        also the ability to detect failures for robust deployment in real-world environments. Although recent advances
+        in vision-language models (VLMs) have significantly improved the spatial reasoning and task-planning
+        capabilities of robots, they remain limited in their ability to recognize their own failures. In particular, a
+        critical yet underexplored challenge lies in detecting semantic misalignment errors, where the robot executes a
+        task that is semantically meaningful but inconsistent with the given instruction. To address this, we propose a
+        method for building datasets targeting Semantic Misalignment Failures detection, from existing
+        language-conditioned manipulation datasets. We also present I-FailSense, an open-source VLM framework with
+        grounded arbitration designed specifically for failure detection. Our approach relies on post-training a base
+        VLM, followed by training lightweight classification heads, called FS blocks, attached to different internal
+        layers of the VLM and whose predictions are aggregated using an ensembling mechanism. Experiments show that
+        I-FailSense outperforms state-of-the-art VLMs, both comparable in size and larger, in detecting semantic
+        misalignment errors. Notably, despite being trained only on semantic misalignment detection, I-FailSense
+        generalizes to broader robotic failure categories and effectively transfers to other simulation environments and
+        real-world with zero-shot or minimal post-training.
+    </p>
+    <p>
+        Accepted to ICRA 2026 IEEE International Conference on Robotics & Automation, 1–5 June, Vienna, Austria! 🎉
+    </p>
+    <div class="links">
+        <a href="https://arxiv.org/abs/2509.16072" target="_blank">📄 arxiv </a>
+        <a href="https://github.com/clemgris/I-FailSense" target="_blank">💻 Code</a>
+        <a href="https://huggingface.co/collections/ACIDE/failsense-3b" target="_blank">🤗 HuggingFace</a>
+    </div>
+</body>
+
+</html>
