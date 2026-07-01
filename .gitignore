@@ -1,20 +1,83 @@
-data/
-venv_lora/
+# =============================================================================
+# I-FailSense — track source, scripts, docs, requirements only
+# =============================================================================
+
+# --- Python / notebooks ---
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# --- Virtual environments (never commit) ---
+.venv/
+.venv-*/
+venv/
+venv_*/
+venv_lora/
+env/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+.cursor/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Training / eval outputs ---
+results*/
+eval_results/
 outputs/
 logs/
 checkpoints/
+runs/
+wandb/
 FS/
-results*/
+
+# --- Model weights & checkpoints (large binaries) ---
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.bin
-*.parquet
-*.tar.gz
-*.zip
-wandb/
-runs/
+*.onnx
+*.msgpack
+
+# --- Datasets, caches, local model snapshots ---
+data/
+datasets/
+models/
+hf_cache/
+.cache/
+huggingface/
 Calvin-3b/
+
+# --- LoRA / fine-tuned Qwen artifacts (outside scratch paths) ---
+Qwen3VL-*/
+debug_Qwen3VL-*/
+
+# --- Archives & bulk downloads ---
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.parquet
+
+# --- HPC job logs (PBS: -j oe writes stdout+stderr to *.oJOBID) ---
+*.o[0-9]*
+*.e[0-9]*
+*.log
+
+# --- Optional: keep repo lean; uncomment if you don't want these in git ---
+# EXPERIMENT_LOG.md
+# SUMMARY_OV2_RESULTS.md

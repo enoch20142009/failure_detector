@@ -66,6 +66,42 @@ python src/finetune_FS.py \
     --num_epochs 10
 ```
 
+---
+
+## OneVision-2 Routed Extension (MaTCA = eval pipeline name only)
+
+This repository also contains an experimental extension on a frozen **LLaVA-OneVision-2-8B-Instruct**
+backbone with optional **pre-LLM Stage-1** task/failure routing and multilayer fusion (NGF, MoE).
+
+**MaTCA** here names a **personal post-LLM eval pipeline** (task-conditioned pooling +
+fusion MLP, I-FailSense-inspired, fusion instead of voting) — **not** a claimed novel method.
+Paper contributions target **Stage-1 pre-LLM grounding/fusion** only.
+
+**Documentation (read in this order):**
+
+| Doc | Contents |
+| --- | --- |
+| [`NGF_ARCH_C_SUPERVISOR_QA.md`](NGF_ARCH_C_SUPERVISOR_QA.md) | **Supervisor Q&A** — Arch C architecture, code map, training loop, param counts |
+| [`NGF_0_V2.md`](NGF_0_V2.md) | **NGF-0 v2 only** — parallel nested fusion formulas, inner/outer loops, run config & results |
+| [`NGF_ARCH_C.md`](NGF_ARCH_C.md) | **Arch C only** — sequential NGF formulas, architecture, your run config & results |
+| [`OV2_ROUTED_ARCHITECTURE.md`](OV2_ROUTED_ARCHITECTURE.md) | Module layout, data flow, NGF v2 / Arch B / Arch C, ablation ladder, results |
+| [`OV2_ROUTING_TRAINING.md`](OV2_ROUTING_TRAINING.md) | GADI setup, CLI flags, job matrix, go/no-go criteria |
+| [`EXPERIMENT_RUN_SCHEDULE.md`](EXPERIMENT_RUN_SCHEDULE.md) | Full run registry (Tracks A/B/C), flag cheat sheet |
+| [`SUMMARY_OV2_RESULTS.md`](SUMMARY_OV2_RESULTS.md) | Baseline/routed/MoE matrix + NGF results |
+| [`PAPER_PLAN.md`](PAPER_PLAN.md) | Paper narrative, method IDs M0–M5, experiment phases |
+| [`PUBLISH_READINESS_CHECKLIST.md`](PUBLISH_READINESS_CHECKLIST.md) | Pre-submission checklist |
+
+Key entry points:
+
+| Script | Purpose |
+| --- | --- |
+| `src/model_ov2_routed_matca.py` | Model (Stage-1 routing/NGF/MoE + fixed post-LLM eval pipeline) |
+| `src/finetune_FS_ov2_routed.py` | Training driver |
+| `src/evaluate_FS_ov2_routed.py` | Evaluation + grounding probe |
+| `gadi_scripts/ov2_routing/` | PBS jobs for GADI (`gpuhopper` + `dgxa100`) |
+
+---
+
 ## 🔗 References
 
 ```
