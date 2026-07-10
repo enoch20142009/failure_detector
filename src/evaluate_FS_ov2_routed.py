@@ -44,6 +44,7 @@ _BOOL_KEYS = {
     "use_hier_router", "use_moe", "share_query", "moe_gate_supervision", "use_merger_adapter",
     "use_nested_guided_fusion", "ngf_inner_guiding", "nested_replace_base",
     "use_ngf_sequential", "use_post_merger_alf", "post_merger_adapter",
+    "use_category_aggregator",
 }
 _INT_LIST_KEYS = {"target_layer_indices", "vision_layer_indices"}
 
@@ -78,6 +79,8 @@ def infer_checkpoint_config(checkpoint_path, config_txt):
         "ngf_tap", "ngf_intermediate_only", "ngf_full_connector",
         "use_post_merger_alf", "post_merger_adapter", "post_merger_adapter_rank",
         "alf_router_dim",
+        "use_category_aggregator", "category_adapter_rank", "category_groups",
+        "category_concat_mode", "category_penultimate_index",
     ):
         if key in ckpt:
             cfg[key] = ckpt[key]
@@ -121,6 +124,21 @@ def gate_entropy_from_logits(logits):
     p = torch.softmax(logits, dim=-1)
     ent = -(p * torch.clamp(p, min=1e-9).log()).sum(dim=-1)
     return float(ent.mean().item())
+
+
+def _to_json_serializable(obj):
+    """Recursively convert tensors / numpy scalars for ``json.dump``."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(v) for v in obj]
+    return obj
 
 
 def build_parser():
@@ -238,6 +256,11 @@ def main():
         post_merger_adapter=_as_bool(cfg.get("post_merger_adapter"), default=True),
         post_merger_adapter_rank=int(cfg.get("post_merger_adapter_rank", 64)),
         alf_router_dim=int(cfg.get("alf_router_dim", 256)),
+        use_category_aggregator=_as_bool(cfg.get("use_category_aggregator"), default=False),
+        category_adapter_rank=int(cfg.get("category_adapter_rank", 256)),
+        category_groups=cfg.get("category_groups"),
+        category_concat_mode=cfg.get("category_concat_mode", "residual_last"),
+        category_penultimate_index=int(cfg.get("category_penultimate_index", 23)),
     )
     if args.vlm_model_id is not None:
         model_kwargs["model_id"] = args.vlm_model_id
@@ -343,6 +366,7 @@ def main():
             "nested_replace_base", "use_ngf_sequential", "layer_balance_coef",
             "use_post_merger_alf", "post_merger_adapter", "post_merger_adapter_rank",
             "alf_router_dim",
+            "use_category_aggregator", "category_adapter_rank",
         )},
     }
 
@@ -374,6 +398,8 @@ def main():
         results["vision_fusion_weights"] = (vision_fusion_weight_acc / denom).tolist()
         if _as_bool(cfg.get("use_nested_guided_fusion")):
             results["ngf_layer_alpha"] = results["vision_fusion_weights"]
+        if _as_bool(cfg.get("use_category_aggregator")):
+            results["category_alpha"] = results["vision_fusion_weights"]
     if ngf_gate_entropy_n:
         results["ngf_mean_patch_gate_entropy"] = ngf_gate_entropy_acc / ngf_gate_entropy_n
     nested_fusion = getattr(model, "nested_fusion", None)
@@ -387,6 +413,11 @@ def main():
         last_seq_gate = getattr(nested_fusion, "last_seq_gate", None)
         if last_seq_gate is not None:
             results["ngf_seq_mean_gate"] = last_seq_gate.detach().float().cpu().tolist()
+    category_aggregator = getattr(model, "category_aggregator", None)
+    if category_aggregator is not None and category_aggregator.gamma is not None:
+        results["category_agg_gamma"] = float(category_aggregator.gamma.detach().item())
+    if category_aggregator is not None:
+        results["category_concat_mode"] = getattr(model, "category_concat_mode", "residual_last")
     post_merger_fusion = getattr(model, "post_merger_fusion", None)
     if post_merger_fusion is not None:
         results["alf_beta"] = float(post_merger_fusion.beta.detach().item())
@@ -400,6 +431,8 @@ def main():
         results["grounding_mean_prob_shift"] = prob_shift / grounding_n
     if args.task_substitution is not None:
         results["task_substitution"] = args.task_substitution
+
+    results = _to_json_serializable(results)
 
     out_path = os.path.join(args.result_folder, "results.json")
     with open(out_path, "w") as handle:

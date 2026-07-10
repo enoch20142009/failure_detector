@@ -125,9 +125,10 @@ def build_parser():
                              "layer weights; fused token field replaces V_base. Mutually "
                              "exclusive with all other Stage-1 toggles.")
     parser.add_argument("--ngf_layer_weight_mode", type=str, default="text",
-                        choices=["text", "static", "uniform", "token"],
+                        choices=["text", "contrastive", "static", "uniform", "token"],
                         help="Outer depth weights alpha_l: task-text routed (text), "
-                             "static learnable, uniform (1/L), or per-patch token-level "
+                             "task−fail contrastive over depth summaries (contrastive; "
+                             "M6), static learnable, uniform (1/L), or per-patch "
                              "alpha_{l,n} (token; Arch B).")
     parser.add_argument("--ngf_sequential", action="store_true",
                         help="Arch C: depth-recurrent residual refinement "
@@ -140,7 +141,8 @@ def build_parser():
                         help="Blend fused field as V_base + eta*(F - V_base), eta init 0, "
                              "instead of fully replacing V_base (ablation A5).")
     parser.add_argument("--layer_balance_coef", type=float, default=0.0,
-                        help="Entropy load-balance weight on NGF depth weights alpha_l.")
+                        help="Entropy load-balance on NGF depth weights alpha_l, "
+                             "category-aggregator alpha, and post-merger ALF depth attention.")
     parser.add_argument("--ngf_inner_beta_l2", type=float, default=0.0,
                         help="L2 shrinkage on NGF inner-residual scales (beta_l / beta_seq). "
                              "Dials back inner-guiding capacity toward inner-OFF for better "
@@ -156,8 +158,8 @@ def build_parser():
                              "last NGF depth (honest intermediate-layer transfer test).")
     parser.add_argument("--ngf_full_connector", action="store_true",
                         help="Replace the frozen patch merger with a fully-trainable, "
-                             "warm-started clone for the NGF path (mutually exclusive "
-                             "with --use_merger_adapter).")
+                             "warm-started clone (NGF or category-agg path; mutually "
+                             "exclusive with --use_merger_adapter).")
 
     # ----- Post-merger ALF fusion (fuse-after-merger) -----
     parser.add_argument("--use_post_merger_alf", action="store_true",
@@ -175,11 +177,30 @@ def build_parser():
     parser.add_argument("--alf_router_dim", type=int, default=256,
                         help="Q/K projection dim for the post-merger ALF cross-attention.")
 
+    # ----- Category contrastive aggregator (IGVA-style 6×4) -----
+    parser.add_argument("--use_category_aggregator", action="store_true",
+                        help="6-category ViT aggregator: mean-pool 4 layers per category, "
+                             "contrastive task−fail weights over categories, concat with "
+                             "V_base and low-rank adapter (gamma init 0). Mutually exclusive "
+                             "with NGF / router / post-merger ALF.")
+    parser.add_argument("--category_adapter_rank", type=int, default=256,
+                        help="Bottleneck rank for concat adapter [V_base; F] -> delta.")
+    parser.add_argument("--category_concat_mode", type=str, default="residual_last",
+                        choices=["residual_last", "igva_penultimate", "igva_base"],
+                        help="residual_last: [V_base;F]+γ residual (default). "
+                             "igva_penultimate: paper-style [F;F_pen] -> adapter. "
+                             "igva_base: patch-VLM [F;V_base] -> adapter.")
+    parser.add_argument("--category_penultimate_index", type=int, default=23,
+                        help="hidden_states index for penultimate layer in igva_penultimate mode.")
+
     # ----- Optimization -----
     parser.add_argument("--batch_size", type=int, default=2,
                         help="Forced to 1 when any Stage-1 module is enabled.")
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--stage1_lr", type=float, default=None,
+                        help="Optional higher LR for Stage-1 modules (router, "
+                             "fusion, merger adapters). MaTCA head uses --lr.")
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--loss_mode", type=str, default="fusion",
                         choices=["fusion", "per_head", "all"])
@@ -281,6 +302,10 @@ def main():
         post_merger_adapter=not args.no_post_merger_adapter,
         post_merger_adapter_rank=args.post_merger_adapter_rank,
         alf_router_dim=args.alf_router_dim,
+        use_category_aggregator=args.use_category_aggregator,
+        category_adapter_rank=args.category_adapter_rank,
+        category_concat_mode=args.category_concat_mode,
+        category_penultimate_index=args.category_penultimate_index,
     )
     if args.vlm_model_id is not None:
         model_kwargs["model_id"] = args.vlm_model_id
@@ -292,6 +317,7 @@ def main():
 
     config = {
         "lr": args.lr,
+        "stage1_lr": args.stage1_lr,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,
         "num_epochs": args.num_epochs,

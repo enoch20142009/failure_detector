@@ -63,6 +63,7 @@ python src/finetune_FS_ov2_routed.py \
   --use_post_merger_alf \
   --vision_layer_indices ${LAYERS} \
   --post_merger_adapter_rank 64 --alf_router_dim 256 \
+  --layer_balance_coef "${LAYER_BALANCE_COEF:-0.01}" \
   --dropout_rate 0.1 --lr 1e-4 --weight_decay 0.1 \
   --result_folder "${RESULT_DIR}"
 

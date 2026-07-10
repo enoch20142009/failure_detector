@@ -370,6 +370,155 @@ class TextLayerRouter(nn.Module):
         return torch.softmax(self.mlp(t_task), dim=-1)
 
 
+class ContrastiveDepthRouter(nn.Module):
+    """Depth-level task vs failure contrastive weights (Option A / M6).
+
+    ``alpha_l = softmax_l(⟨q_task, K_l⟩ - ⟨q_fail, K_l⟩)`` with
+    ``K_l = W_K · mean_n(V_l)``. Text scores depths only; fused field stays visual.
+    """
+
+    def __init__(self, vision_dim, query_dim, num_layers, router_dim=256):
+        super().__init__()
+        self.num_layers = num_layers
+        self.w_k = nn.Linear(vision_dim, router_dim)
+        self.w_qt = nn.Linear(query_dim, router_dim)
+        self.w_qf = nn.Linear(query_dim, router_dim)
+        self.scale = router_dim ** -0.5
+
+    def forward(self, stacked, t_task, t_fail):
+        """``stacked`` [B, L, N, Dv]; queries [B, Dq] -> ``alpha`` [B, L]."""
+        mu = stacked.mean(dim=2)                              # [B, L, Dv]
+        keys = self.w_k(mu)                                   # [B, L, Dr]
+        qt = self.w_qt(t_task).unsqueeze(1)                   # [B, 1, Dr]
+        qf = self.w_qf(t_fail).unsqueeze(1)
+        s_task = (qt * keys).sum(-1) * self.scale             # [B, L]
+        s_fail = (qf * keys).sum(-1) * self.scale
+        logits = s_task - s_fail
+        return torch.softmax(logits, dim=-1)
+
+
+# Default OV2-24 grouping: 6 categories × 4 post-block hidden_states indices.
+# Index k = after encoder block (k-1); index 24 = final block (native merger input).
+DEFAULT_CATEGORY_GROUPS = (
+    (1, 2, 3, 4),
+    (5, 6, 7, 8),
+    (9, 10, 11, 12),
+    (13, 14, 15, 16),
+    (17, 18, 19, 20),
+    (21, 22, 23, 24),
+)
+
+
+class CategoryContrastiveAggregator(nn.Module):
+    """IGVA-style category aggregator with contrastive instruction routing.
+
+    Groups ViT depths into ``C`` categories (default 6×4 on OV2-24). Within each
+    category, mean-pool the member layers into a category field ``μ_c``. A
+    contrastive task−fail router assigns category weights
+
+        α = softmax(s_task − s_fail)
+
+    then ``F = Σ_c α_c · μ_c``.
+
+    Three concat modes:
+
+    * ``igva_penultimate`` (paper): ``V_out = Adapter([F ; F_pen])``
+    * ``igva_base`` (patch-VLM analogue): ``V_out = Adapter([F ; V_base])``
+    * ``residual_last`` (prior run): ``V_out = V_base + γ · Adapter([V_base ; F])``
+    """
+
+    def __init__(
+        self,
+        vision_dim,
+        query_dim,
+        category_groups=None,
+        router_dim=256,
+        adapter_rank=256,
+        layer_balance_coef=0.0,
+        concat_mode="residual_last",
+        penultimate_index=23,
+    ):
+        super().__init__()
+        if category_groups is None:
+            category_groups = DEFAULT_CATEGORY_GROUPS
+        self.category_groups = tuple(tuple(g) for g in category_groups)
+        self.num_categories = len(self.category_groups)
+        self.layer_balance_coef = layer_balance_coef
+        self.concat_mode = concat_mode
+        self.penultimate_index = penultimate_index
+        self.flat_indices = tuple(
+            idx for group in self.category_groups for idx in group
+        )
+
+        self.category_router = ContrastiveDepthRouter(
+            vision_dim=vision_dim,
+            query_dim=query_dim,
+            num_layers=self.num_categories,
+            router_dim=router_dim,
+        )
+        # Channel concat adapter: 2·Dv → Dv (IGVA paper order or residual delta).
+        self.adapter = nn.Sequential(
+            nn.LayerNorm(vision_dim * 2),
+            nn.Linear(vision_dim * 2, adapter_rank),
+            nn.GELU(),
+            nn.Linear(adapter_rank, vision_dim),
+        )
+        self.gamma = (
+            nn.Parameter(torch.zeros(1))
+            if concat_mode == "residual_last"
+            else None
+        )
+
+        self.last_alpha = None
+        self.last_aux_loss = None
+
+    def forward(self, hidden_states, v_base, t_task, t_fail):
+        """``hidden_states``: encoder tuple; ``v_base`` [B, N, Dv] merger input."""
+        cat_feats = []
+        for group in self.category_groups:
+            members = []
+            for idx in group:
+                if idx >= len(hidden_states):
+                    raise RuntimeError(
+                        f"Category group requested hidden_states[{idx}] but encoder "
+                        f"returned only {len(hidden_states)} states."
+                    )
+                members.append(hidden_states[idx].float())
+            # Intra-category mean over the 4 member depths → [B, N, Dv].
+            cat_feats.append(torch.stack(members, dim=0).mean(dim=0))
+
+        stacked = torch.stack(cat_feats, dim=1)  # [B, C, N, Dv]
+        alpha = self.category_router(stacked, t_task, t_fail)  # [B, C]
+        self.last_alpha = alpha.detach().mean(dim=0)
+
+        fused = torch.sum(stacked * alpha[:, :, None, None], dim=1)  # [B, N, Dv]
+        if self.concat_mode == "igva_penultimate":
+            if self.penultimate_index >= len(hidden_states):
+                raise RuntimeError(
+                    f"Penultimate index {self.penultimate_index} unavailable; encoder "
+                    f"returned only {len(hidden_states)} hidden states."
+                )
+            penultimate = hidden_states[self.penultimate_index].float()
+            concat = torch.cat([fused, penultimate], dim=-1)  # [B, N, 2Dv]
+            out = self.adapter(concat)
+        elif self.concat_mode == "igva_base":
+            concat = torch.cat([fused, v_base], dim=-1)  # [B, N, 2Dv]
+            out = self.adapter(concat)
+        elif self.concat_mode == "residual_last":
+            concat = torch.cat([v_base, fused], dim=-1)  # [B, N, 2Dv]
+            delta = self.adapter(concat)
+            out = v_base + self.gamma * delta
+        else:
+            raise ValueError(f"Unknown category concat_mode: {self.concat_mode}")
+
+        if self.layer_balance_coef > 0:
+            mean_alpha = alpha.mean(dim=0).clamp(min=1e-9)
+            self.last_aux_loss = self.layer_balance_coef * (mean_alpha * mean_alpha.log()).sum()
+        else:
+            self.last_aux_loss = None
+        return out
+
+
 class TokenDepthRouter(nn.Module):
     """Per-patch, per-depth depth weights ``alpha_{l,n}`` (Arch B).
 
@@ -430,10 +579,10 @@ class NestedGuidedFusion(nn.Module):
         F_n = sum_l alpha_l * h_{l,n}
 
     No spatial pooling inside a layer (token count ``N`` is preserved). ``alpha``
-    is task-text routed (``layer_weight_mode='text'``), static learnable
-    (``'static'``), uniform (``'uniform'``), or per-patch token-level routed
-    (``'token'``, Arch B: ``alpha_{l,n}`` from ``TokenDepthRouter``). When
-    ``inner_guiding`` is False, ``h_l = V_l`` (raw features, TGIF-style outer
+    is task-text routed (``layer_weight_mode='text'``), contrastive task−fail
+    (``'contrastive'``, M6), static learnable (``'static'``), uniform
+    (``'uniform'``), or per-patch token-level routed (``'token'``, Arch B).
+    When ``inner_guiding`` is False, ``h_l = V_l`` (raw features, TGIF-style outer
     fusion only).
 
     With ``replace_base=True`` the fused field replaces ``V_base`` entirely. With
@@ -481,6 +630,10 @@ class NestedGuidedFusion(nn.Module):
 
         if layer_weight_mode == "text":
             self.layer_router = TextLayerRouter(query_dim, num_layers, hidden_dim)
+        elif layer_weight_mode == "contrastive":
+            self.layer_router = ContrastiveDepthRouter(
+                vision_dim, query_dim, num_layers, router_dim=router_dim
+            )
         elif layer_weight_mode == "static":
             self.layer_logits = nn.Parameter(torch.zeros(num_layers))
         elif layer_weight_mode == "uniform":
@@ -553,7 +706,12 @@ class NestedGuidedFusion(nn.Module):
             else:
                 self.last_aux_loss = None
         else:
-            alpha = self._alpha(t_task, layer_tokens[0].device, layer_tokens[0].dtype)
+            if self.layer_weight_mode == "contrastive":
+                alpha = self.layer_router(stacked, t_task, t_fail)
+            else:
+                alpha = self._alpha(
+                    t_task, layer_tokens[0].device, layer_tokens[0].dtype
+                )
             self.last_alpha = alpha.detach().mean(dim=0)
             fused = torch.sum(stacked * alpha[:, :, None, None], dim=1)  # [B, N, Dv]
             if self.layer_balance_coef > 0 and self.layer_weight_mode != "uniform":
@@ -1007,11 +1165,13 @@ class PostMergerCrossLayerFusion(nn.Module):
     evidence, gated by the task/failure queries.
     """
 
-    def __init__(self, feature_dim, query_dim, num_layers, router_dim=256):
+    def __init__(self, feature_dim, query_dim, num_layers, router_dim=256,
+                 layer_balance_coef=0.0):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_layers = num_layers
         self.scale = router_dim ** 0.5
+        self.layer_balance_coef = layer_balance_coef
 
         self.W_q = nn.Linear(feature_dim, router_dim, bias=False)
         self.W_k = nn.Linear(feature_dim, router_dim, bias=False)
@@ -1025,6 +1185,7 @@ class PostMergerCrossLayerFusion(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1))
 
         self.last_alpha = None  # mean per-depth attention weight, for logging.
+        self.last_aux_loss = None
 
     def forward(self, h_base, h_layers, task_query, fail_query):
         """``h_base`` [M, D]; ``h_layers`` list of L tensors [M, D]; queries [1, Q]."""
@@ -1042,7 +1203,14 @@ class PostMergerCrossLayerFusion(nn.Module):
         attn = torch.softmax(logits, dim=-1)                            # [M, L]
         ctx = (attn.unsqueeze(-1) * vals).sum(dim=1)                    # [M, D]
         delta = self.W_o(ctx)
-        self.last_alpha = attn.mean(dim=0).detach()
+        mean_alpha = attn.mean(dim=0)                                   # [L]
+        self.last_alpha = mean_alpha.detach()
+        if self.layer_balance_coef > 0:
+            ma = mean_alpha.clamp(min=1e-9)
+            # Minimize negative entropy -> encourage spread across depths.
+            self.last_aux_loss = self.layer_balance_coef * (ma * ma.log()).sum()
+        else:
+            self.last_aux_loss = None
         return h_base + self.beta * delta
 
 
@@ -1067,9 +1235,10 @@ class _PostMergerALFMerger(nn.Module):
     """Fuse-after-merger wrapper: per-depth frozen merger -> ALF cross-attention.
 
     ``V_base`` passes through the frozen merger *unmixed* to form the anchor
-    ``H_base``; each intermediate encoder ``hidden_states[idx]`` is merged
-    separately and combined with a residual cross-attention. No pre-merger
-    ``apply_upstream`` blending happens on this path.
+    ``H_base`` (``x`` is already ``layernorm_post(h[24])`` from the native
+    vision forward). Each intermediate ``hidden_states[idx]`` is post-LN'd with
+    the same frozen ``vision_model.layernorm_post`` before merger, then fused
+    via residual cross-attention. No pre-merger ``apply_upstream`` blending.
     """
 
     def __init__(self, original_merger, parent):
@@ -1089,7 +1258,12 @@ class _PostMergerALFMerger(nn.Module):
             return h_base
 
         h_layers = [
-            self.merger(hidden_states[idx].to(x.dtype), patch_positions=patch_positions)
+            self.merger(
+                parent._prepare_merger_vision_tokens(
+                    hidden_states[idx], dtype=x.dtype
+                ),
+                patch_positions=patch_positions,
+            )
             for idx in parent.vision_layer_indices
         ]
 
@@ -1101,6 +1275,7 @@ class _PostMergerALFMerger(nn.Module):
             parent._task_query,
             parent._fail_query,
         )
+        parent._aux_loss = fusion.last_aux_loss
         if parent.post_merger_adapter is not None:
             adapter = parent.post_merger_adapter
             h_out = h_out + adapter.gamma * adapter(h_out)
@@ -1156,6 +1331,11 @@ class OV2RoutedMaTCA(nn.Module):
         post_merger_adapter=True,
         post_merger_adapter_rank=64,
         alf_router_dim=256,
+        use_category_aggregator=False,
+        category_adapter_rank=256,
+        category_groups=None,
+        category_concat_mode="residual_last",
+        category_penultimate_index=23,
     ):
         super().__init__()
 
@@ -1189,11 +1369,28 @@ class OV2RoutedMaTCA(nn.Module):
             or use_tgif_fusion
             or use_hier_fusion
             or use_moe
+            or use_category_aggregator
         ):
             raise ValueError(
                 "--use_nested_guided_fusion is mutually exclusive with "
                 "--use_router, --use_hier_router, --use_fuse_then_route, "
-                "--use_tgif_fusion, --use_hier_fusion, and --use_moe"
+                "--use_tgif_fusion, --use_hier_fusion, --use_moe, and "
+                "--use_category_aggregator"
+            )
+
+        if use_category_aggregator and (
+            use_router
+            or use_hier_router
+            or use_fuse_then_route
+            or use_tgif_fusion
+            or use_hier_fusion
+            or use_moe
+            or use_nested_guided_fusion
+            or use_post_merger_alf
+        ):
+            raise ValueError(
+                "--use_category_aggregator is mutually exclusive with other "
+                "Stage-1 fusion/routing toggles (router, hier, NGF, post-merger ALF)"
             )
 
         if ngf_tap not in ("block", "ffn_act"):
@@ -1205,9 +1402,10 @@ class OV2RoutedMaTCA(nn.Module):
                 "--ngf_intermediate_only requires --use_nested_guided_fusion"
             )
         if ngf_full_connector:
-            if not use_nested_guided_fusion:
+            if not (use_nested_guided_fusion or use_category_aggregator):
                 raise ValueError(
-                    "--ngf_full_connector requires --use_nested_guided_fusion"
+                    "--ngf_full_connector requires --use_nested_guided_fusion "
+                    "or --use_category_aggregator"
                 )
             if use_merger_adapter:
                 raise ValueError(
@@ -1224,12 +1422,13 @@ class OV2RoutedMaTCA(nn.Module):
                 or use_hier_fusion
                 or use_moe
                 or use_nested_guided_fusion
+                or use_category_aggregator
             ):
                 raise ValueError(
                     "--use_post_merger_alf is mutually exclusive with "
                     "--use_router, --use_hier_router, --use_fuse_then_route, "
-                    "--use_tgif_fusion, --use_hier_fusion, --use_moe, and "
-                    "--use_nested_guided_fusion"
+                    "--use_tgif_fusion, --use_hier_fusion, --use_moe, "
+                    "--use_nested_guided_fusion, and --use_category_aggregator"
                 )
             if use_merger_adapter:
                 raise ValueError(
@@ -1274,6 +1473,15 @@ class OV2RoutedMaTCA(nn.Module):
         self.post_merger_adapter_enabled = post_merger_adapter
         self.post_merger_adapter_rank = post_merger_adapter_rank
         self.alf_router_dim = alf_router_dim
+        self.use_category_aggregator = use_category_aggregator
+        self.category_adapter_rank = category_adapter_rank
+        self.category_concat_mode = category_concat_mode
+        self.category_penultimate_index = category_penultimate_index
+        self.category_groups = (
+            tuple(tuple(g) for g in category_groups)
+            if category_groups is not None
+            else DEFAULT_CATEGORY_GROUPS
+        )
 
         # ----- Load and freeze the OneVision-2 backbone -----
         self.processor = AutoProcessor.from_pretrained(
@@ -1327,12 +1535,18 @@ class OV2RoutedMaTCA(nn.Module):
 
         if vision_layer_indices is None:
             vision_layer_indices = [9, 17, 24]
+        if self.use_category_aggregator:
+            # Always derive taps from category groups (ignore sparse CLI defaults).
+            vision_layer_indices = [
+                idx for group in self.category_groups for idx in group
+            ]
         self.vision_layer_indices = vision_layer_indices
         if (
             self.use_hier_fusion
             or self.use_hier_router
             or self.use_nested_guided_fusion
             or self.use_post_merger_alf
+            or self.use_category_aggregator
         ):
             self._validate_vision_layer_indices()
 
@@ -1444,6 +1658,19 @@ class OV2RoutedMaTCA(nn.Module):
                     replace_base=nested_replace_base,
                 )
 
+        self.category_aggregator = None
+        if self.use_category_aggregator:
+            self.category_aggregator = CategoryContrastiveAggregator(
+                vision_dim=self.vision_dim,
+                query_dim=self.feature_dim,
+                category_groups=self.category_groups,
+                router_dim=router_dim,
+                adapter_rank=category_adapter_rank,
+                layer_balance_coef=layer_balance_coef,
+                concat_mode=category_concat_mode,
+                penultimate_index=category_penultimate_index,
+            )
+
         # FFN-Act taps live at the FFN expansion width (intermediate_size); a
         # per-depth linear projects them back to vision_dim before fusion.
         self.ffn_act_down = None
@@ -1484,6 +1711,8 @@ class OV2RoutedMaTCA(nn.Module):
             self.moe.to(self.device)
         if self.nested_fusion is not None:
             self.nested_fusion.to(self.device)
+        if self.category_aggregator is not None:
+            self.category_aggregator.to(self.device)
 
         self.merger_adapter = None
         if self.use_merger_adapter:
@@ -1504,7 +1733,9 @@ class OV2RoutedMaTCA(nn.Module):
         # no rank-64 parallel adapter). Built in float32 like the other trainable
         # Stage-1 modules; the wrapper casts to/from the backbone dtype.
         self.full_connector = None
-        if self.use_nested_guided_fusion and self.ngf_full_connector:
+        if self.ngf_full_connector and (
+            self.use_nested_guided_fusion or self.use_category_aggregator
+        ):
             native_merger = self.vision_model.merger
             for param in native_merger.parameters():
                 param.requires_grad = False
@@ -1526,6 +1757,7 @@ class OV2RoutedMaTCA(nn.Module):
                 query_dim=self.feature_dim,
                 num_layers=len(self.vision_layer_indices),
                 router_dim=alf_router_dim,
+                layer_balance_coef=self.layer_balance_coef,
             )
             self.post_merger_fusion.to(self.device)
             if self.post_merger_adapter_enabled:
@@ -1560,6 +1792,8 @@ class OV2RoutedMaTCA(nn.Module):
             or self.use_merger_adapter
             or self.use_nested_guided_fusion
             or self.use_post_merger_alf
+            or self.use_category_aggregator
+            or self.ngf_full_connector
         ):
             try:
                 self.vlm.gradient_checkpointing_enable(
@@ -1633,6 +1867,19 @@ class OV2RoutedMaTCA(nn.Module):
         else:
             self.vision_model.merger = _RoutedMerger(native_merger, self)
 
+    def _prepare_merger_vision_tokens(self, tokens, dtype=None):
+        """Match native OV2 merger input: ``layernorm_post`` then frozen merger.
+
+        The vision forward applies ``layernorm_post`` to the final encoder output
+        before ``merger``; intermediate ALF depths must use the same norm layer.
+        """
+        if dtype is not None:
+            tokens = tokens.to(dtype)
+        layernorm_post = getattr(self.vision_model, "layernorm_post", None)
+        if layernorm_post is not None:
+            tokens = layernorm_post(tokens)
+        return tokens
+
     # ---- Upstream application (called from inside the vision forward) ----
     def apply_upstream(self, x):
         """Apply hierarchical fusion + routing/MoE to pre-merger visual tokens.
@@ -1646,6 +1893,22 @@ class OV2RoutedMaTCA(nn.Module):
 
         orig_dtype = x.dtype
         x32 = x.float()
+
+        if self.use_category_aggregator:
+            if self._encoder_hidden_states is None:
+                raise RuntimeError(
+                    "Category aggregator is enabled but encoder hidden states "
+                    "were not captured. The encoder hook did not fire."
+                )
+            x32 = self.category_aggregator(
+                self._encoder_hidden_states,
+                x32,
+                self._task_query,
+                self._fail_query,
+            )
+            self._last_vision_fusion_weights = self.category_aggregator.last_alpha
+            self._aux_loss = self.category_aggregator.last_aux_loss
+            return x32.to(orig_dtype)
 
         if self.use_nested_guided_fusion:
             if self.ngf_tap == "ffn_act":
@@ -1856,6 +2119,7 @@ class OV2RoutedMaTCA(nn.Module):
             or self.use_merger_adapter
             or self.use_nested_guided_fusion
             or self.use_post_merger_alf
+            or self.use_category_aggregator
         )
         self._aux_loss = None
 
@@ -1871,6 +2135,7 @@ class OV2RoutedMaTCA(nn.Module):
             or self.use_hier_router
             or self.use_nested_guided_fusion
             or self.use_post_merger_alf
+            or self.use_category_aggregator
             or (self.use_hier_fusion and self.fusion_mode == "text")
         ):
             self._compute_query_embeddings(tasks)
@@ -1967,6 +2232,8 @@ class OV2RoutedMaTCA(nn.Module):
             params.extend(self.moe.parameters())
         if self.nested_fusion is not None:
             params.extend(self.nested_fusion.parameters())
+        if self.category_aggregator is not None:
+            params.extend(self.category_aggregator.parameters())
         if self.merger_adapter is not None:
             params.extend(self.merger_adapter.parameters())
         if self.ffn_act_down is not None:
@@ -1978,6 +2245,51 @@ class OV2RoutedMaTCA(nn.Module):
         if self.post_merger_adapter is not None:
             params.extend(self.post_merger_adapter.parameters())
         return params
+
+    def stage1_parameters(self):
+        """Pre-LLM Stage-1 modules (routing, fusion, merger-side adapters)."""
+        params = []
+        if self.hier_fusion is not None:
+            params.extend(self.hier_fusion.parameters())
+        if self.router is not None:
+            params.extend(self.router.parameters())
+        if self.hier_router is not None:
+            params.extend(self.hier_router.parameters())
+        if self.moe is not None:
+            params.extend(self.moe.parameters())
+        if self.nested_fusion is not None:
+            params.extend(self.nested_fusion.parameters())
+        if self.category_aggregator is not None:
+            params.extend(self.category_aggregator.parameters())
+        if self.merger_adapter is not None:
+            params.extend(self.merger_adapter.parameters())
+        if self.ffn_act_down is not None:
+            params.extend(self.ffn_act_down.parameters())
+        if self.full_connector is not None:
+            params.extend(self.full_connector.parameters())
+        if self.post_merger_fusion is not None:
+            params.extend(self.post_merger_fusion.parameters())
+        if self.post_merger_adapter is not None:
+            params.extend(self.post_merger_adapter.parameters())
+        return params
+
+    def head_parameters(self):
+        """MaTCA head params (classifiers, pooling, layer fusion)."""
+        stage1_ids = {id(p) for p in self.stage1_parameters()}
+        return [p for p in self.trainable_parameters() if id(p) not in stage1_ids]
+
+    def optimizer_param_groups(self, lr, stage1_lr=None, weight_decay=0.0):
+        """Build AdamW param groups; optional higher LR on Stage-1 modules."""
+        if stage1_lr is None or stage1_lr == lr:
+            return [{"params": self.trainable_parameters(), "lr": lr}]
+        stage1 = self.stage1_parameters()
+        head = self.head_parameters()
+        groups = []
+        if stage1:
+            groups.append({"params": stage1, "lr": stage1_lr})
+        if head:
+            groups.append({"params": head, "lr": lr})
+        return groups
 
     def num_trainable_parameters(self):
         return sum(p.numel() for p in self.trainable_parameters() if p.requires_grad)
@@ -2021,6 +2333,11 @@ class OV2RoutedMaTCA(nn.Module):
             "post_merger_adapter": self.post_merger_adapter_enabled,
             "post_merger_adapter_rank": self.post_merger_adapter_rank,
             "alf_router_dim": self.alf_router_dim,
+            "use_category_aggregator": self.use_category_aggregator,
+            "category_adapter_rank": self.category_adapter_rank,
+            "category_concat_mode": self.category_concat_mode,
+            "category_penultimate_index": self.category_penultimate_index,
+            "category_groups": [list(g) for g in self.category_groups],
             "layer_fusion": self.layer_fusion.state_dict(),
             "fused_classifier": self.fused_classifier.state_dict(),
         }
@@ -2038,6 +2355,8 @@ class OV2RoutedMaTCA(nn.Module):
             checkpoint["moe"] = self.moe.state_dict()
         if self.nested_fusion is not None:
             checkpoint["nested_fusion"] = self.nested_fusion.state_dict()
+        if self.category_aggregator is not None:
+            checkpoint["category_aggregator"] = self.category_aggregator.state_dict()
         if self.merger_adapter is not None:
             checkpoint["merger_adapter"] = self.merger_adapter.state_dict()
         if self.ffn_act_down is not None:
@@ -2080,6 +2399,10 @@ class OV2RoutedMaTCA(nn.Module):
             self.moe.load_state_dict(checkpoint["moe"], strict=strict)
         if self.nested_fusion is not None and "nested_fusion" in checkpoint:
             self.nested_fusion.load_state_dict(checkpoint["nested_fusion"], strict=strict)
+        if self.category_aggregator is not None and "category_aggregator" in checkpoint:
+            self.category_aggregator.load_state_dict(
+                checkpoint["category_aggregator"], strict=strict
+            )
         if self.merger_adapter is not None and "merger_adapter" in checkpoint:
             self.merger_adapter.load_state_dict(checkpoint["merger_adapter"], strict=strict)
         if self.ffn_act_down is not None and "ffn_act_down" in checkpoint:
@@ -2154,8 +2477,22 @@ def train_model(model, train_dataset, val_dataset, config):
     trainable_params = model.trainable_parameters()
     print(f"Trainable parameters: {model.num_trainable_parameters():,}")
 
+    stage1_lr = config.get("stage1_lr")
+    param_groups = model.optimizer_param_groups(
+        lr=config["lr"],
+        stage1_lr=stage1_lr,
+        weight_decay=config["weight_decay"],
+    )
+    if stage1_lr is not None and stage1_lr != config["lr"]:
+        n_stage1 = sum(p.numel() for g in param_groups[:1] for p in g["params"])
+        n_head = sum(p.numel() for g in param_groups[1:] for p in g["params"])
+        print(
+            f"[optimizer] Stage-1 lr={stage1_lr:.2e} ({n_stage1:,} params); "
+            f"head lr={config['lr']:.2e} ({n_head:,} params)"
+        )
+
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        param_groups,
         lr=config["lr"],
         weight_decay=config["weight_decay"],
     )
@@ -2320,6 +2657,17 @@ def train_model(model, train_dataset, val_dataset, config):
             if beta_seq is not None:
                 bseq = [round(float(b), 4) for b in beta_seq.detach().float().cpu().tolist()]
                 print(f"  NGF seq beta ({layer_labels}) = {bseq}")
+        if model.category_aggregator is not None:
+            if model.category_aggregator.gamma is not None:
+                print(f"  cat-agg gamma (concat adapter) = {model.category_aggregator.gamma.item():.4f}")
+            else:
+                print(f"  cat-agg concat mode = {model.category_concat_mode} (no gamma)")
+            if model._last_vision_fusion_weights is not None:
+                aw = model._last_vision_fusion_weights.detach().float().cpu().reshape(-1)
+                alpha_weights = [round(float(w), 3) for w in aw.tolist()]
+                print(f"  category alpha (C={len(alpha_weights)}) = {alpha_weights}")
+                if max(alpha_weights) > 0.9:
+                    print("  [collapse-guard] max(category alpha) > 0.9 — consider raising --layer_balance_coef")
         if model.merger_adapter is not None:
             print(f"  gamma (merger adapter)  = {model.merger_adapter.gamma.item():.4f}")
         if model.post_merger_fusion is not None:
@@ -2330,6 +2678,11 @@ def train_model(model, train_dataset, val_dataset, config):
                 print(
                     f"  ALF depth attn (layers {model.vision_layer_indices}) = {alpha_weights}"
                 )
+                if max(alpha_weights) > 0.9:
+                    print(
+                        "  [collapse-guard] ALF max(depth attn) > 0.9 — "
+                        "consider raising --layer_balance_coef"
+                    )
             if model.post_merger_adapter is not None:
                 print(
                     f"  gamma (post-merger adapter) = "
